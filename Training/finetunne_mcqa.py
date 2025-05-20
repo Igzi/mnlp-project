@@ -1,13 +1,7 @@
 import os
 import torch
 import numpy as np
-import math
 import faiss
-import pickle
-from langchain.docstore import InMemoryDocstore
-from langchain.schema import Document
-from langchain_community.vectorstores.utils import DistanceStrategy
-from langchain_huggingface import HuggingFaceEmbeddings
 from datasets import load_dataset, concatenate_datasets
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM,
@@ -18,7 +12,6 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from torch.utils.data import Dataset
 from sklearn.metrics import accuracy_score
-from langchain_community.vectorstores import FAISS
 
 # === Constants ===
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
@@ -38,59 +31,42 @@ model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
 # model.to(device)
 
 # === Load and Split Document Corpus ===
-corpus = load_dataset(DOCUMENTS_DS, split="train").select([0,1,2,3,4])
+# corpus = load_dataset(DOCUMENTS_DS, split="train")
 
-splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
-    tokenizer=tokenizer,
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=int(CHUNK_SIZE / 10),
-    add_start_index=True,
-    strip_whitespace=True,
-    separators=MARKDOWN_SEPARATORS,
-)
+# splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
+#     tokenizer=tokenizer,
+#     chunk_size=CHUNK_SIZE,
+#     chunk_overlap=int(CHUNK_SIZE / 10),
+#     add_start_index=True,
+#     strip_whitespace=True,
+#     separators=MARKDOWN_SEPARATORS,
+# )
 
-print("🔍 Splitting documents...")
-chunks = []
-for doc in corpus:
-    chunks.extend(splitter.split_text(doc["text"]))
+# print("🔍 Splitting documents...")
+# chunks = []
+# for doc in corpus:
+#     chunks.extend(splitter.split_text(doc["text"]))
 
-# === Embed Chunks ===
-print("🔍 Embedding document chunks...")
-model_kwargs = {
-    "device": "cuda" if torch.cuda.is_available() else "cpu", # Dynamically check cuda
-}
-encode_kwargs = {
-    "normalize_embeddings": True
-}
-embedding_model = HuggingFaceEmbeddings(
-            model_name=ENCODER_NAME,
-            model_kwargs=model_kwargs,
-            encode_kwargs=encode_kwargs,
-        )
-# === Load FAISS Index and Supporting Files ===
-print("📥 Loading FAISS index and metadata...")
-index = faiss.read_index("faiss_index.index")
+# # === Embed Chunks ===
+# print("🔍 Embedding document chunks...")
+# encoder = SentenceTransformer(ENCODER_NAME)
+# embeddings = encoder.encode(
+#     chunks, batch_size=64, show_progress_bar=True,
+#     convert_to_numpy=True, normalize_embeddings=True
+# )
 
-with open("docstore.pkl", "rb") as f:
-    docstore = pickle.load(f)
-
-with open("index_to_docstore_id.pkl", "rb") as f:
-    index_to_docstore_id = pickle.load(f)
-vector_db = FAISS(
-            embedding_function=embedding_model.embed_query,
-            index=index,
-            docstore=docstore,
-            index_to_docstore_id=index_to_docstore_id,
-            distance_strategy=DistanceStrategy.COSINE,
-            normalize_L2=True
-        )
+# # === Build FAISS Index ===
+# print("🔍 Building FAISS index...")
+# dim = embeddings.shape[1]
+# index = faiss.IndexFlatIP(dim)
+# index.add(embeddings)
+# faiss.write_index(index, "faiss_index.index")
 
 LETTER_INDICES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
 class MCQADataset(Dataset):
     def __init__(self, data, tokenizer):
         self.tokenizer = tokenizer
         self.data = data
-        self.encoder = SentenceTransformer(ENCODER_NAME)
 
     def __len__(self):
         return len(self.data)
@@ -102,26 +78,12 @@ class MCQADataset(Dataset):
     
         # Build prompt
         topic = "knowledge and skills in advanced master-level STEM courses"
-        instruction = f"The following are multiple choice questions (with answers) about {topic}.\n\n"
         prompt = (
+            f"The following are multiple choice questions (with answers) about {topic}.\n\n"
             f"{ex['question']}\n" +
             "".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, ex["choices"])]) +
             "Answer:"
         )
-
-        D = vector_db.similarity_search(query=prompt, k=3)
-
-        print(len(D))
-
-        retrieved_docs_text = [doc.page_content for doc in D]
-        context = "\nRelavent Documents:\n"
-        context += "\n\n".join([
-            f"Document {str(i)}:::\n" + doc
-            for i, doc in enumerate(retrieved_docs_text)
-        ])
-
-        prompt = instruction + context + prompt
-        print(prompt)
     
         # Tokenize separately
         prompt_enc = self.tokenizer(prompt, add_special_tokens=False)
@@ -146,35 +108,35 @@ class MCQADataset(Dataset):
 
 # === Load Fine-tuning and Validation Datasets ===
 print("🔍 Loading datasets...")
-train_data = concatenate_datasets([
-    load_dataset(MCQA_DS, 'MMLU', split="train").select(range(100)),
-    load_dataset(MCQA_DS, 'ARC-Easy', split="train").select(range(100)),
-    load_dataset(MCQA_DS, 'OpenBookQA', split="train").select(range(100)),
-    load_dataset(MCQA_DS, 'ScienceQA', split="train").select(range(100))
-])
-
-# === Validation data ===
-val_data = concatenate_datasets([
-    load_dataset(MCQA_DS, 'MMLU', split="validation").select(range(40)),
-    load_dataset(MCQA_DS, 'ARC-Easy', split="validation").select(range(40)),
-    load_dataset(MCQA_DS, 'OpenBookQA', split="validation").select(range(40)),
-    load_dataset(MCQA_DS, 'ScienceQA', split="validation").select(range(40))
-])
-
 # train_data = concatenate_datasets([
-#     load_dataset(MCQA_DS, 'MMLU', split="train"),
-#     load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
-#     load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
-#     load_dataset(MCQA_DS, 'ScienceQA', split="train")
+#     load_dataset(MCQA_DS, 'MMLU', split="train").select(range(100)),
+#     load_dataset(MCQA_DS, 'ARC-Easy', split="train").select(range(100)),
+#     load_dataset(MCQA_DS, 'OpenBookQA', split="train").select(range(100)),
+#     load_dataset(MCQA_DS, 'ScienceQA', split="train").select(range(100))
 # ])
 
 # # === Validation data ===
 # val_data = concatenate_datasets([
-#     load_dataset(MCQA_DS, 'MMLU', split="validation"),
-#     load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
-#     load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
-#     load_dataset(MCQA_DS, 'ScienceQA', split="validation")
+#     load_dataset(MCQA_DS, 'MMLU', split="validation").select(range(40)),
+#     load_dataset(MCQA_DS, 'ARC-Easy', split="validation").select(range(40)),
+#     load_dataset(MCQA_DS, 'OpenBookQA', split="validation").select(range(40)),
+#     load_dataset(MCQA_DS, 'ScienceQA', split="validation").select(range(40))
 # ])
+
+train_data = concatenate_datasets([
+    load_dataset(MCQA_DS, 'MMLU', split="train"),
+    load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
+    load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
+    load_dataset(MCQA_DS, 'ScienceQA', split="train")
+])
+
+# === Validation data ===
+val_data = concatenate_datasets([
+    load_dataset(MCQA_DS, 'MMLU', split="validation"),
+    load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
+    load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
+    load_dataset(MCQA_DS, 'ScienceQA', split="validation")
+])
 
 
 train_dataset = MCQADataset(train_data, tokenizer)
