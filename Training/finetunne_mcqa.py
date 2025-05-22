@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 import faiss
+from torch.nn import functional as F
 from datasets import load_dataset, concatenate_datasets
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM,
@@ -12,11 +13,10 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from torch.utils.data import Dataset
 from sklearn.metrics import accuracy_score
+from torch.utils.data import DataLoader
 
 # === Constants ===
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
-ENCODER_NAME = "igzi/MNLP_M2_document_encoder"
-DOCUMENTS_DS = "igzi/pile-stem-corpus-small-semantic"
 MCQA_DS = "igzi/MNLP_M2_mcqa_dataset"
 CHUNK_SIZE = 512
 MARKDOWN_SEPARATORS = [
@@ -58,31 +58,41 @@ class MCQADatasetClassification(Dataset):
         }
 
 class MCQATrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=1):
         prompts = inputs["prompt"]
         completions = inputs["options"]
         correct_idxs = inputs["correct_idx"]
 
         batch_size = len(prompts)
         device = model.device
-        tokenizer = self.tokenizer
         option_logits = []
 
-        for i in range(batch_size):
-            prompt = prompts[i]
-            options = completions[i]
-
-            logits = []
-            for opt in options:
-                # Encode prompt + option
-                enc = tokenizer(prompt + opt, return_tensors="pt", padding=True).to(device)
-                with torch.no_grad():
+        with torch.cuda.amp.autocast():
+            for i in range(batch_size):
+                prompt = prompts[i]
+                options = completions[i]
+    
+                logits = []
+                for opt in options:
+                    # Encode prompt + option
+                    enc = tokenizer(
+                        prompt + opt, 
+                        return_tensors="pt", 
+                        padding=True,
+                        truncation=True,
+                        max_length=2048
+                    ).to(device)
+                    
+                    with torch.no_grad():  # No need for gradients on labels
+                        labels = enc["input_ids"].clone()
                     labels = enc["input_ids"].clone()
                     output = model(**enc, labels=labels)
                     nll = output.loss * labels.size(1)  # Total neg log likelihood
-                logits.append(-nll)
-
-            option_logits.append(torch.stack(logits))
+                    logits.append(-nll)
+                    del enc, labels, output
+                    torch.cuda.empty_cache()
+    
+                option_logits.append(torch.stack(logits))
 
         logits = torch.stack(option_logits)  # shape: (batch, num_options)
         targets = torch.tensor(correct_idxs, dtype=torch.long, device=device)
@@ -90,48 +100,113 @@ class MCQATrainer(Trainer):
 
         return (loss, logits) if return_outputs else loss
 
+    def get_train_dataloader(self) -> DataLoader:
+        dataloader_params = {
+            "batch_size": 1,
+            "collate_fn": self.data_collator
+        }
+        return DataLoader(self.train_dataset, **dataloader_params)
+
+    def get_eval_dataloader(self, eval_dataset) -> DataLoader:
+        dataloader_params = {
+            "batch_size": 1,
+            "collate_fn": self.data_collator
+        }
+        return DataLoader(eval_dataset, **dataloader_params)
+
+    def evaluate(self, ignore_keys=None):
+        model = self.model
+        model.eval()
+        dataloader = self.get_eval_dataloader(self.eval_dataset)
+        device = model.device
+    
+        correct = 0
+        total = 0
+    
+        # Use inference mode and mixed precision for evaluation
+        with torch.inference_mode(), torch.cuda.amp.autocast():
+            for batch in dataloader:
+                prompts = batch["prompt"]
+                options = batch["options"]
+                correct_idxs = batch["correct_idx"]
+    
+                for i in range(len(prompts)):
+                    prompt = prompts[i]
+                    opts = options[i]
+                    target = correct_idxs[i]
+                    scores = []
+    
+                    for opt in opts:
+                        # Encode with truncation to prevent OOM
+                        enc = tokenizer(
+                            prompt + opt,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                            max_length=model.config.max_position_embeddings
+                        ).to(device)
+                        
+                        labels = enc["input_ids"].clone()
+                        
+                        # Forward pass - no need for output object storage
+                        with torch.no_grad():
+                            output = model(**enc, labels=labels)
+                            nll = output.loss * labels.size(1)
+                        
+                        scores.append(-nll.item())
+                        
+                        # Explicit cleanup
+                        del enc, labels, output
+                        torch.cuda.empty_cache()
+    
+                    pred = int(torch.argmax(torch.tensor(scores)))
+                    correct += (pred == target)
+                    total += 1
+    
+        accuracy = correct / total if total > 0 else 0.0
+        print("Evaluation accuracy: ", accuracy)
+        return {"accuracy": accuracy}
+
 
 # === Load Fine-tuning and Validation Datasets ===
 print("🔍 Loading datasets...")
-train_data = concatenate_datasets([
-    load_dataset(MCQA_DS, 'MMLU', split="train").select(range(100)),
-    # load_dataset(MCQA_DS, 'ARC-Easy', split="train").select(range(100)),
-    # load_dataset(MCQA_DS, 'OpenBookQA', split="train").select(range(100)),
-    # load_dataset(MCQA_DS, 'ScienceQA', split="train").select(range(100))
-])
-
-# === Validation data ===
-val_data = concatenate_datasets([
-    load_dataset(MCQA_DS, 'MMLU', split="validation").select(range(40)),
-    # load_dataset(MCQA_DS, 'ARC-Easy', split="validation").select(range(40)),
-    # load_dataset(MCQA_DS, 'OpenBookQA', split="validation").select(range(40)),
-    # load_dataset(MCQA_DS, 'ScienceQA', split="validation").select(range(40))
-])
-
 # train_data = concatenate_datasets([
-#     load_dataset(MCQA_DS, 'MMLU', split="train"),
-#     # load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
-#     # load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
-#     # load_dataset(MCQA_DS, 'ScienceQA', split="train")
+#     load_dataset(MCQA_DS, 'MMLU', split="train").select(range(1000)),
+#     # load_dataset(MCQA_DS, 'ARC-Easy', split="train").select(range(100)),
+#     # load_dataset(MCQA_DS, 'OpenBookQA', split="train").select(range(100)),
+#     # load_dataset(MCQA_DS, 'ScienceQA', split="train").select(range(100))
 # ])
 
 # # === Validation data ===
 # val_data = concatenate_datasets([
-#     load_dataset(MCQA_DS, 'MMLU', split="validation"),
-#     # load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
-#     # load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
-#     # load_dataset(MCQA_DS, 'ScienceQA', split="validation")
+#     load_dataset(MCQA_DS, 'MMLU', split="validation").select(range(100)),
+#     # load_dataset(MCQA_DS, 'ARC-Easy', split="validation").select(range(40)),
+#     # load_dataset(MCQA_DS, 'OpenBookQA', split="validation").select(range(40)),
+#     # load_dataset(MCQA_DS, 'ScienceQA', split="validation").select(range(40))
 # ])
+
+train_data = concatenate_datasets([
+    load_dataset(MCQA_DS, 'MMLU', split="train"),
+    # load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
+    # load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
+    # load_dataset(MCQA_DS, 'ScienceQA', split="train")
+])
+
+# === Validation data ===
+val_data = concatenate_datasets([
+    load_dataset(MCQA_DS, 'MMLU', split="validation"),
+    # load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
+    # load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
+    # load_dataset(MCQA_DS, 'ScienceQA', split="validation")
+])
 
 
 train_dataset = MCQADatasetClassification(train_data, tokenizer)
 val_dataset = MCQADatasetClassification(val_data, tokenizer)
-
-sample = train_dataset[0]  # Should return dict with "prompt", "options", "correct_idx"
-print(sample) 
+train_data = train_data.shuffle(seed=42)
+val_data = val_data.shuffle(seed=42)
 
 def collatefn(batch):
-    print("Here: ", batch)
     return {
         "prompt": [item["prompt"] for item in batch],
         "options": [item["options"] for item in batch],
@@ -140,11 +215,12 @@ def collatefn(batch):
 
 training_args = TrainingArguments(
     output_dir="./finetuned_model",
-    gradient_accumulation_steps = 8,
+    gradient_accumulation_steps = 64,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
+    learning_rate=5e-6,
     bf16=True,                       # Enables mixed precision (reduce memory usage)
-    num_train_epochs=2,
+    num_train_epochs=5,
     save_total_limit=3,                     # ✅ Keep only latest checkpoint
     save_safetensors=False,                 # ✅ Save in .bin format to reduce size
     logging_dir="./logs",
@@ -157,6 +233,7 @@ training_args = TrainingArguments(
     logging_steps=len(train_dataset),
 )
 
+
 # === Trainer ===
 trainer = MCQATrainer(
     model=model,
@@ -166,10 +243,11 @@ trainer = MCQATrainer(
     data_collator=collatefn,
 )
 
-# === Run Training and Push to Hub ===
+trainer.evaluate()
+# # === Run Training and Push to Hub ===
 print("🚀 Starting training...")
 trainer.train()
 print("📤 Uploading model to Hugging Face Hub...")
 trainer.push_to_hub()
 
-print("✅ Done.")
+# print("✅ Done.")
