@@ -37,25 +37,6 @@ model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # model.to(device)
 
-# === Load and Split Document Corpus ===
-corpus = load_dataset(DOCUMENTS_DS, split="train").select([0,1,2,3,4])
-
-splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
-    tokenizer=tokenizer,
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=int(CHUNK_SIZE / 10),
-    add_start_index=True,
-    strip_whitespace=True,
-    separators=MARKDOWN_SEPARATORS,
-)
-
-print("🔍 Splitting documents...")
-chunks = []
-for doc in corpus:
-    chunks.extend(splitter.split_text(doc["text"]))
-
-# === Embed Chunks ===
-print("🔍 Embedding document chunks...")
 model_kwargs = {
     "device": "cuda" if torch.cuda.is_available() else "cpu", # Dynamically check cuda
 }
@@ -85,6 +66,8 @@ vector_db = FAISS(
             normalize_L2=True
         )
 
+print(vector_db.index.ntotal)
+
 LETTER_INDICES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
 class MCQADataset(Dataset):
     def __init__(self, data, tokenizer):
@@ -111,8 +94,6 @@ class MCQADataset(Dataset):
 
         D = vector_db.similarity_search(query=prompt, k=3)
 
-        print(len(D))
-
         retrieved_docs_text = [doc.page_content for doc in D]
         context = "\nRelavent Documents:\n"
         context += "\n\n".join([
@@ -121,9 +102,10 @@ class MCQADataset(Dataset):
         ])
 
         prompt = instruction + context + prompt
-        print(prompt)
     
         # Tokenize separately
+        max_size = 2048
+
         prompt_enc = self.tokenizer(prompt, add_special_tokens=False)
         answer_enc = self.tokenizer(" " + full_answer, add_special_tokens=False)
 
@@ -136,7 +118,7 @@ class MCQADataset(Dataset):
 
         # Labels: -100 for prompt part, actual answer tokens
         labels = [-100] * len(prompt_enc["input_ids"]) + answer_enc["input_ids"]
-
+        
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
@@ -145,36 +127,36 @@ class MCQADataset(Dataset):
 
 
 # === Load Fine-tuning and Validation Datasets ===
-print("🔍 Loading datasets...")
-train_data = concatenate_datasets([
-    load_dataset(MCQA_DS, 'MMLU', split="train").select(range(100)),
-    load_dataset(MCQA_DS, 'ARC-Easy', split="train").select(range(100)),
-    load_dataset(MCQA_DS, 'OpenBookQA', split="train").select(range(100)),
-    load_dataset(MCQA_DS, 'ScienceQA', split="train").select(range(100))
-])
-
-# === Validation data ===
-val_data = concatenate_datasets([
-    load_dataset(MCQA_DS, 'MMLU', split="validation").select(range(40)),
-    load_dataset(MCQA_DS, 'ARC-Easy', split="validation").select(range(40)),
-    load_dataset(MCQA_DS, 'OpenBookQA', split="validation").select(range(40)),
-    load_dataset(MCQA_DS, 'ScienceQA', split="validation").select(range(40))
-])
-
+# print("🔍 Loading datasets...")
 # train_data = concatenate_datasets([
-#     load_dataset(MCQA_DS, 'MMLU', split="train"),
-#     load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
-#     load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
-#     load_dataset(MCQA_DS, 'ScienceQA', split="train")
+#     load_dataset(MCQA_DS, 'MMLU', split="train").select(range(50)),
+#     load_dataset(MCQA_DS, 'ARC-Easy', split="train").select(range(50)),
+#     load_dataset(MCQA_DS, 'OpenBookQA', split="train").select(range(50)),
+#     load_dataset(MCQA_DS, 'ScienceQA', split="train").select(range(50))
 # ])
 
 # # === Validation data ===
 # val_data = concatenate_datasets([
-#     load_dataset(MCQA_DS, 'MMLU', split="validation"),
-#     load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
-#     load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
-#     load_dataset(MCQA_DS, 'ScienceQA', split="validation")
+#     load_dataset(MCQA_DS, 'MMLU', split="validation").select(range(20)),
+#     load_dataset(MCQA_DS, 'ARC-Easy', split="validation").select(range(20)),
+#     load_dataset(MCQA_DS, 'OpenBookQA', split="validation").select(range(20)),
+#     load_dataset(MCQA_DS, 'ScienceQA', split="validation").select(range(20))
 # ])
+
+train_data = concatenate_datasets([
+    load_dataset(MCQA_DS, 'MMLU', split="train"),
+    load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
+    load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
+    load_dataset(MCQA_DS, 'ScienceQA', split="train")
+])
+
+# === Validation data ===
+val_data = concatenate_datasets([
+    load_dataset(MCQA_DS, 'MMLU', split="validation"),
+    load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
+    load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
+    load_dataset(MCQA_DS, 'ScienceQA', split="validation")
+])
 
 
 train_dataset = MCQADataset(train_data, tokenizer)
@@ -184,18 +166,20 @@ val_dataset = MCQADataset(val_data, tokenizer)
 
 training_args = TrainingArguments(
     output_dir="./finetuned_model",
+    gradient_accumulation_steps = 128,
     per_device_train_batch_size=1,  # Start large; adjust based on memory
     per_device_eval_batch_size=1,
-    fp16=True,                       # Enables mixed precision (reduce memory usage)
+    bf16=True,                       # Enables mixed precision (reduce memory usage)
     num_train_epochs=3,
-    save_total_limit=1,                     # ✅ Keep only latest checkpoint
+    save_total_limit=3,                     # ✅ Keep only latest checkpoint
     save_safetensors=False,                 # ✅ Save in .bin format to reduce size
     logging_dir="./logs",
     push_to_hub=True,
-    hub_model_id="igzi/Qwen3-0.6B-answer-first-token",
+    hub_model_id="igzi/Qwen3-0.6B-finetunned-rag",
     eval_steps=1,
     eval_strategy="epoch",
-    logging_steps=len(train_dataset),
+    save_strategy="epoch",
+    logging_strategy="epoch",
 )
 
 # === Trainer ===

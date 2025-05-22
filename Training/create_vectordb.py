@@ -20,7 +20,6 @@ from sklearn.metrics import accuracy_score
 from langchain_community.vectorstores import FAISS
 
 # === Constants ===
-MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
 ENCODER_NAME = "igzi/MNLP_M2_document_encoder"
 DOCUMENTS_DS = "igzi/pile-stem-corpus-small-semantic"
 MCQA_DS = "igzi/MNLP_M2_mcqa_dataset"
@@ -30,8 +29,7 @@ MARKDOWN_SEPARATORS = [
 ]
 
 # === Load Tokenizer and Model ===
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(ENCODER_NAME, trust_remote_code=True)
 # Move model to GPU
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # model.to(device)
@@ -126,6 +124,8 @@ if hasattr(index, 'is_trained') and not index.is_trained:
         device_id = 0  # or whichever GPU you want
         index = faiss.index_cpu_to_gpu(res, device_id, index)
         index.train(embeddings_np)
+
+index.add(np.asarray(embeddings, dtype="float32"))
 
 documents = [Document(page_content=chunk) for chunk in chunks]
 
