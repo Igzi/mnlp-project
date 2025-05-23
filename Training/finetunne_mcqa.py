@@ -27,7 +27,7 @@ MARKDOWN_SEPARATORS = [
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True,
                 padding_side="left",
                 truncation_side="left",)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, revision="main", trust_remote_code=True)
 
 LETTER_INDICES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
 
@@ -53,7 +53,7 @@ class MCQADatasetClassification(Dataset):
 
         return {
             "prompt": prompt,
-            "options": [f" {letter}." for letter in LETTER_INDICES[:len(ex["choices"])]],
+            "options": [f" {letter}" for letter in LETTER_INDICES[:len(ex["choices"])]],
             "correct_idx": correct_index,
         }
 
@@ -85,7 +85,6 @@ class MCQATrainer(Trainer):
                     
                     with torch.no_grad():  # No need for gradients on labels
                         labels = enc["input_ids"].clone()
-                    labels = enc["input_ids"].clone()
                     output = model(**enc, labels=labels)
                     nll = output.loss * labels.size(1)  # Total neg log likelihood
                     logits.append(-nll)
@@ -143,7 +142,7 @@ class MCQATrainer(Trainer):
                             return_tensors="pt",
                             padding=True,
                             truncation=True,
-                            max_length=model.config.max_position_embeddings
+                            max_length=2048
                         ).to(device)
                         
                         labels = enc["input_ids"].clone()
@@ -213,24 +212,29 @@ def collatefn(batch):
         "correct_idx": [item["correct_idx"] for item in batch],
     }
 
+steps_per_epoch = len(train_dataset) // 64
+half_epoch_steps = steps_per_epoch // 2
+
 training_args = TrainingArguments(
-    output_dir="./finetuned_model",
+    output_dir="./finetuned_model2",
     gradient_accumulation_steps = 64,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
-    learning_rate=5e-6,
+    learning_rate=1e-5,
     bf16=True,                       # Enables mixed precision (reduce memory usage)
-    num_train_epochs=5,
-    save_total_limit=3,                     # ✅ Keep only latest checkpoint
+    num_train_epochs=3,
     save_safetensors=False,                 # ✅ Save in .bin format to reduce size
     logging_dir="./logs",
     push_to_hub=True,
-    hub_model_id="igzi/Qwen3-0.6B-answer-first-token",
-    eval_steps=1,
-    eval_strategy="epoch",
-    save_strategy="epoch",
+    hub_model_id="igzi/Qwen3-0.6B-answer-first-token2",
+    eval_strategy="steps",                  # ⬅️ switched from 'epoch'
+    save_strategy="steps",                  # ⬅️ switched from 'epoch'
+    eval_steps=half_epoch_steps,            # ⬅️ half epoch
+    save_steps=half_epoch_steps,            # ⬅️ half epoch
     max_grad_norm=0.5,
     logging_steps=len(train_dataset),
+    warmup_ratio = 0.03,
+    gradient_checkpointing=True,
 )
 
 
@@ -244,7 +248,7 @@ trainer = MCQATrainer(
 )
 
 trainer.evaluate()
-# # === Run Training and Push to Hub ===
+# === Run Training and Push to Hub ===
 print("🚀 Starting training...")
 trainer.train()
 print("📤 Uploading model to Hugging Face Hub...")
