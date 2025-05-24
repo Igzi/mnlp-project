@@ -55,47 +55,58 @@ class MCQADatasetClassification(Dataset):
             "prompt": prompt,
             "options": [f" {letter}" for letter in LETTER_INDICES[:len(ex["choices"])]],
             "correct_idx": correct_index,
+            "dataset": ex["dataset"]
         }
 
 class MCQATrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=1):
-        prompts = inputs["prompt"]
-        completions = inputs["options"]
-        correct_idxs = inputs["correct_idx"]
-
-        batch_size = len(prompts)
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        For each prompt we run the model once, grab the final (next‐token)
+        logits, index into the letter‐token IDs, and compute a CE loss.
+        """
         device = model.device
-        option_logits = []
+        prompts      = inputs["prompt"]       # List[str]
+        correct_idxs = inputs["correct_idx"]  # List[int]
+        all_options  = inputs["options"]      # List[List[str]]
 
-        with torch.cuda.amp.autocast():
-            for i in range(batch_size):
-                prompt = prompts[i]
-                options = completions[i]
-    
-                logits = []
-                for opt in options:
-                    # Encode prompt + option
-                    enc = tokenizer(
-                        prompt + opt, 
-                        return_tensors="pt", 
-                        padding=True,
-                        truncation=True,
-                        max_length=2048
-                    ).to(device)
-                    
-                    with torch.no_grad():  # No need for gradients on labels
-                        labels = enc["input_ids"].clone()
-                    output = model(**enc, labels=labels)
-                    nll = output.loss * labels.size(1)  # Total neg log likelihood
-                    logits.append(-nll)
-                    del enc, labels, output
-                    torch.cuda.empty_cache()
-    
-                option_logits.append(torch.stack(logits))
+        batch_logits = []
+        losses = []
 
-        logits = torch.stack(option_logits)  # shape: (batch, num_options)
-        targets = torch.tensor(correct_idxs, dtype=torch.long, device=device)
-        loss = F.cross_entropy(logits, targets)
+        # Pre‐tokenize all option‐letters to single token IDs
+        option_token_ids = [
+            [ tokenizer(opt, add_special_tokens=False).input_ids[0]
+              for opt in opts ]
+            for opts in all_options
+        ]
+
+        for prompt, opt_ids, target in zip(prompts, option_token_ids, correct_idxs):
+            # 1) encode prompt
+            enc = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=2048
+            ).to(device)
+
+            # 2) single forward pass
+            outputs = model(**enc)
+            # outputs.logits: [1, seq_len, vocab_size]
+            last_logits = outputs.logits[:, -1, :]            # [1, V]
+
+            # 3) pick out the logits for our option tokens → [1, num_opts]
+            opt_logits = last_logits[:, opt_ids]               # [1, num_opts]
+            batch_logits.append(opt_logits.squeeze(0))         # [num_opts]
+
+            # 4) CE against the correct index
+            tgt = torch.tensor([target], device=device)
+            losses.append(F.cross_entropy(opt_logits, tgt))
+
+            del enc, outputs, last_logits, opt_logits, tgt
+            torch.cuda.empty_cache()
+
+        loss = torch.stack(losses).mean()
+        logits = torch.stack(batch_logits)                   # [batch, num_opts]
 
         return (loss, logits) if return_outputs else loss
 
@@ -118,25 +129,36 @@ class MCQATrainer(Trainer):
         model.eval()
         dataloader = self.get_eval_dataloader(self.eval_dataset)
         device = model.device
-    
-        correct = 0
-        total = 0
-    
-        # Use inference mode and mixed precision for evaluation
+
+        # track per‐dataset stats
+        correct_by_ds = {}
+        total_by_ds   = {}
+
+        # overall stats
+        overall_correct = 0
+        overall_total   = 0
+
         with torch.inference_mode(), torch.cuda.amp.autocast():
             for batch in dataloader:
-                prompts = batch["prompt"]
-                options = batch["options"]
+                prompts      = batch["prompt"]
+                options      = batch["options"]
                 correct_idxs = batch["correct_idx"]
-    
+                datasets     = batch["dataset"]
+
                 for i in range(len(prompts)):
-                    prompt = prompts[i]
-                    opts = options[i]
-                    target = correct_idxs[i]
+                    ds_name = datasets[i]
+                    prompt  = prompts[i]
+                    opts    = options[i]
+                    target  = correct_idxs[i]
+
+                    # ensure counters exist
+                    if ds_name not in correct_by_ds:
+                        correct_by_ds[ds_name] = 0
+                        total_by_ds[ds_name]   = 0
+
+                    # score each option by negative NLL
                     scores = []
-    
                     for opt in opts:
-                        # Encode with truncation to prevent OOM
                         enc = tokenizer(
                             prompt + opt,
                             return_tensors="pt",
@@ -144,27 +166,41 @@ class MCQATrainer(Trainer):
                             truncation=True,
                             max_length=2048
                         ).to(device)
-                        
                         labels = enc["input_ids"].clone()
-                        
-                        # Forward pass - no need for output object storage
-                        with torch.no_grad():
-                            output = model(**enc, labels=labels)
-                            nll = output.loss * labels.size(1)
-                        
+                        out = model(**enc, labels=labels)
+                        nll = out.loss * labels.size(1)
                         scores.append(-nll.item())
-                        
-                        # Explicit cleanup
-                        del enc, labels, output
+                        del enc, labels, out
                         torch.cuda.empty_cache()
-    
+
                     pred = int(torch.argmax(torch.tensor(scores)))
-                    correct += (pred == target)
-                    total += 1
-    
-        accuracy = correct / total if total > 0 else 0.0
-        print("Evaluation accuracy: ", accuracy)
-        return {"accuracy": accuracy}
+
+                    # update stats
+                    is_correct = (pred == target)
+                    correct_by_ds[ds_name] += int(is_correct)
+                    total_by_ds[ds_name]   += 1
+                    overall_correct += int(is_correct)
+                    overall_total   += 1
+
+        # compute accuracies
+        acc_by_ds = {
+            ds: correct_by_ds[ds] / total_by_ds[ds]
+            for ds in correct_by_ds
+        }
+        overall_acc = overall_correct / overall_total if overall_total > 0 else 0.0
+
+        # print results
+        print(f"→ Overall accuracy: {overall_acc:.4f} " 
+              f"({overall_correct}/{overall_total})")
+        for ds, acc in acc_by_ds.items():
+            c, t = correct_by_ds[ds], total_by_ds[ds]
+            print(f"→ {ds} accuracy: {acc:.4f} ({c}/{t})")
+
+        # return as metrics dict
+        metrics = {"accuracy": overall_acc}
+        metrics.update({f"accuracy_{ds}": acc for ds, acc in acc_by_ds.items()})
+        return metrics
+
 
 
 # === Load Fine-tuning and Validation Datasets ===
@@ -186,7 +222,8 @@ print("🔍 Loading datasets...")
 
 train_data = concatenate_datasets([
     load_dataset(MCQA_DS, 'MMLU', split="train"),
-    # load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
+    load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
+    load_dataset(MCQA_DS, 'ARC-Challenge', split="train"),
     # load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
     # load_dataset(MCQA_DS, 'ScienceQA', split="train")
 ])
@@ -194,7 +231,8 @@ train_data = concatenate_datasets([
 # === Validation data ===
 val_data = concatenate_datasets([
     load_dataset(MCQA_DS, 'MMLU', split="validation"),
-    # load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
+    load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
+    load_dataset(MCQA_DS, 'ARC-Challenge', split="validation"),
     # load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
     # load_dataset(MCQA_DS, 'ScienceQA', split="validation")
 ])
@@ -210,13 +248,14 @@ def collatefn(batch):
         "prompt": [item["prompt"] for item in batch],
         "options": [item["options"] for item in batch],
         "correct_idx": [item["correct_idx"] for item in batch],
+        "dataset": [item["dataset"] for item in batch],
     }
 
 steps_per_epoch = len(train_dataset) // 64
 half_epoch_steps = steps_per_epoch // 2
 
 training_args = TrainingArguments(
-    output_dir="./finetuned_model2",
+    output_dir="./finetuned_full_dataset_mcqa",
     gradient_accumulation_steps = 64,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
@@ -226,14 +265,14 @@ training_args = TrainingArguments(
     save_safetensors=False,                 # ✅ Save in .bin format to reduce size
     logging_dir="./logs",
     push_to_hub=True,
-    hub_model_id="igzi/Qwen3-0.6B-answer-first-token2",
+    hub_model_id="igzi/Qwen3-0.6B-full-dataset-mcqa",
     eval_strategy="steps",                  # ⬅️ switched from 'epoch'
     save_strategy="steps",                  # ⬅️ switched from 'epoch'
     eval_steps=half_epoch_steps,            # ⬅️ half epoch
     save_steps=half_epoch_steps,            # ⬅️ half epoch
     max_grad_norm=0.5,
     logging_steps=len(train_dataset),
-    warmup_ratio = 0.03,
+    warmup_ratio = 0.05,
     gradient_checkpointing=True,
 )
 
@@ -250,8 +289,8 @@ trainer = MCQATrainer(
 trainer.evaluate()
 # === Run Training and Push to Hub ===
 print("🚀 Starting training...")
-trainer.train()
-print("📤 Uploading model to Hugging Face Hub...")
-trainer.push_to_hub()
+#trainer.train()
+# print("📤 Uploading model to Hugging Face Hub...")
+# trainer.push_to_hub()
 
 # print("✅ Done.")

@@ -2,8 +2,8 @@ from huggingface_hub import HfApi, HfFolder, create_repo, upload_folder
 from transformers import AutoTokenizer
 
 # === Config ===
-repo_id = "igzi/Qwen3-0.6B-finetuned-mmlu"
-checkpoint_path = "./finetuned_model/checkpoint-618"
+repo_id = "igzi/MNLP_M2_rag_model"
+checkpoint_path = "./finetuned_full_dataset_rag/checkpoint-258"
 
 api = HfApi()
 try:
@@ -16,13 +16,13 @@ upload_folder(
     folder_path=checkpoint_path,
     repo_id=repo_id,
     path_in_repo="",  # root
-    commit_message="Upload fine-tuned model checkpoint 618",
+    commit_message="Upload fine-tuned model checkpoint 258",
 )
 
 # Upload to your fine-tuned repo
 upload_folder(
     folder_path="./qwen-tokenizer",
-    repo_id="igzi/Qwen3-0.6B-finetuned-mmlu",
+    repo_id=repo_id,
     path_in_repo="",
     commit_message="Add tokenizer files from base model",
 )
