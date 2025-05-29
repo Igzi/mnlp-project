@@ -34,7 +34,7 @@ MARKDOWN_SEPARATORS = [
 
 # === Load Tokenizer and Model ===
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True, torch_dtype=torch.bfloat16)
 # Move model to GPU
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # model.to(device)
@@ -59,7 +59,7 @@ with open("docstore.pkl", "rb") as f:
 
 with open("index_to_docstore_id.pkl", "rb") as f:
     index_to_docstore_id = pickle.load(f)
-vector_db = FAISS(
+    vector_db = FAISS(
             embedding_function=embedding_model.embed_query,
             index=index,
             docstore=docstore,
@@ -91,7 +91,7 @@ class MCQADatasetClassification(Dataset):
             "Answer:"
         )
 
-        D = vector_db.similarity_search(query=prompt, k=2)
+        D = vector_db.similarity_search(query=prompt, k=3)
 
         retrieved_docs_text = [doc.page_content for doc in D]
         context = "\nRelavent Documents:\n"
@@ -311,7 +311,7 @@ steps_per_epoch = len(train_dataset) // 64
 half_epoch_steps = steps_per_epoch // 2
 
 training_args = TrainingArguments(
-    output_dir="./finetuned_full_dataset_rag",
+    output_dir="./finetuned_full_dataset_rag_new",
     gradient_accumulation_steps = 64,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,

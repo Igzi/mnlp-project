@@ -9,40 +9,36 @@ device = torch.device("cuda")
 model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 model = model.to(device)
 
+print("Loading data...")
 # Load dataset
-filtered_data = load_dataset("igzi/pile-stem-corpus-filtered", split="train")
-subset = filtered_data.shuffle(seed=42).select(range(500_000))
-texts = [example for example in subset]
+filtered_data = load_dataset("igzi/pile-stem-corpus-filtered", split="train").select(range(1500000, 2000000))
+print("Data loaded")
+filtered_data = filtered_data.remove_columns(["input_ids", "attention_mask"])
+texts = [text for text in filtered_data]
 
-# Embedding function with tqdm
-def embed_tokenized_chunks(model, tokenized_texts, max_batch_size=1024):
+def embed_text_chunks(model, texts, max_batch_size=1024):
     embeddings = []
     batch_size = max_batch_size
     idx = 0
 
-    pbar = tqdm(total=len(tokenized_texts), desc="Embedding")
+    pbar = tqdm(total=len(texts), desc="Embedding")
 
-    while idx < len(tokenized_texts):
+    while idx < len(texts):
         try:
-            end_idx = min(idx + batch_size, len(tokenized_texts))
-            batch = tokenized_texts[idx:end_idx]
-            input_ids = [item["input_ids"] for item in batch]
-            attention_mask = [item.get("attention_mask", [1] * len(item["input_ids"])) for item in batch]
-
-            batch_tokenized = [
-                {"input_ids": ids, "attention_mask": mask}
-                for ids, mask in zip(input_ids, attention_mask)
-            ]
+            end_idx = min(idx + batch_size, len(texts))
+            batch = texts[idx:end_idx]
 
             emb = model.encode(
-                batch_tokenized,
+                batch,
                 normalize_embeddings=True,
                 show_progress_bar=False,
-                is_pretokenized=True,
+                is_pretokenized=False  # default; can omit
             )
+
             embeddings.append(emb)
             pbar.update(end_idx - idx)
             idx = end_idx
+
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
                 torch.cuda.empty_cache()
@@ -55,14 +51,15 @@ def embed_tokenized_chunks(model, tokenized_texts, max_batch_size=1024):
     return np.vstack(embeddings)
 
 # Run embedding with progress
-embeddings = embed_tokenized_chunks(model, texts)
+print("Embedding documents...")
+embeddings = embed_text_chunks(model, texts)
 embedding_list = embeddings.tolist()
 
 # Add to dataset
-subset = subset.add_column("embedding", embedding_list)
+subset = filtered_data.add_column("embedding", embedding_list)
 
 # Save locally
-subset.save_to_disk("pile-stem-corpus-filtered-embedded")
+subset.save_to_disk("pile-stem-corpus-filtered-embedded4")
 
 # Push to Hub
-subset.push_to_hub("igzi/pile-stem-corpus-filtered-embedded")
+#subset.push_to_hub("igzi/pile-stem-corpus-filtered-embedded")

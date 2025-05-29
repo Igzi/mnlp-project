@@ -2,8 +2,8 @@ from huggingface_hub import HfApi, HfFolder, create_repo, upload_folder
 from transformers import AutoTokenizer
 
 # === Config ===
-repo_id = "igzi/MNLP_M2_rag_model"
-checkpoint_path = "./finetuned_full_dataset_rag/checkpoint-258"
+repo_id = "igzi/finetuned_m2_mcqa_rag_new"
+checkpoint_path = "./finetuned_m2_mcqa_rag_new/checkpoint-258"
 
 api = HfApi()
 try:

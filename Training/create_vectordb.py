@@ -21,7 +21,7 @@ from langchain_community.vectorstores import FAISS
 
 # === Constants ===
 ENCODER_NAME = "igzi/MNLP_M2_document_encoder"
-DOCUMENTS_DS = "igzi/pile-stem-corpus-small-semantic"
+DOCUMENTS_DS = "igzi/new-small-corpus"
 MCQA_DS = "igzi/MNLP_M2_mcqa_dataset"
 CHUNK_SIZE = 512
 MARKDOWN_SEPARATORS = [
