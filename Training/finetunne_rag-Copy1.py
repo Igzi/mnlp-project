@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from torch.nn import functional as F
 
 # === Constants ===
-MODEL_NAME = "Qwen/Qwen3-"
+MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
 ENCODER_NAME = "igzi/MNLP_M2_document_encoder"
 DOCUMENTS_DS = "igzi/pile-stem-corpus-small-semantic"
 MCQA_DS = "igzi/MNLP_M3_rag_dataset"
@@ -108,7 +108,7 @@ class MCQADatasetClassification(Dataset):
 
         return {
             "prompt": prompt,
-            "options": [f" {letter}" for letter in LETTER_INDICES[:len(ex["choices"])]],
+            "options": [f" {letter}. {answer}" for letter, answer in zip(LETTER_INDICES[:len(ex["choices"])], ex["choices"])],
             "correct_idx": correct_index,
             "dataset": ex["dataset"]
         }
@@ -116,53 +116,32 @@ class MCQADatasetClassification(Dataset):
 
 class MCQATrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        For each prompt we run the model once, grab the final (next‐token)
-        logits, index into the letter‐token IDs, and compute a CE loss.
-        """
+        prompts = inputs["prompt"]
+        completions = inputs["options"]
+        correct_idxs = inputs["correct_idx"]
+
+        batch_size = len(prompts)
         device = model.device
-        prompts      = inputs["prompt"]       # List[str]
-        correct_idxs = inputs["correct_idx"]  # List[int]
-        all_options  = inputs["options"]      # List[List[str]]
+        option_logits = []
 
-        batch_logits = []
-        losses = []
+        for i in range(batch_size):
+            prompt = prompts[i]
+            options = completions[i]
 
-        # Pre‐tokenize all option‐letters to single token IDs
-        option_token_ids = [
-            [ tokenizer(opt, add_special_tokens=False).input_ids[0]
-              for opt in opts ]
-            for opts in all_options
-        ]
+            logits = []
+            for opt in options:
+                # Encode prompt + option
+                enc = tokenizer(prompt + opt, return_tensors="pt", padding=True).to(device)
+                labels = enc["input_ids"].clone()
+                output = model(**enc, labels=labels)
+                nll = output.loss * labels.size(1)  # Total neg log likelihood
+                logits.append(-nll)
 
-        for prompt, opt_ids, target in zip(prompts, option_token_ids, correct_idxs):
-            # 1) encode prompt
-            enc = tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=2048
-            ).to(device)
+            option_logits.append(torch.stack(logits))
 
-            # 2) single forward pass
-            outputs = model(**enc)
-            # outputs.logits: [1, seq_len, vocab_size]
-            last_logits = outputs.logits[:, -1, :]            # [1, V]
-
-            # 3) pick out the logits for our option tokens → [1, num_opts]
-            opt_logits = last_logits[:, opt_ids]               # [1, num_opts]
-            batch_logits.append(opt_logits.squeeze(0))         # [num_opts]
-
-            # 4) CE against the correct index
-            tgt = torch.tensor([target], device=device)
-            losses.append(F.cross_entropy(opt_logits, tgt))
-
-            del enc, outputs, last_logits, opt_logits, tgt
-            torch.cuda.empty_cache()
-
-        loss = torch.stack(losses).mean()
-        logits = torch.stack(batch_logits)                   # [batch, num_opts]
+        logits = torch.stack(option_logits)  # shape: (batch, num_options)
+        targets = torch.tensor(correct_idxs, dtype=torch.long, device=device)
+        loss = F.cross_entropy(logits, targets)
 
         return (loss, logits) if return_outputs else loss
 
@@ -315,7 +294,7 @@ steps_per_epoch = len(train_dataset) // 64
 half_epoch_steps = steps_per_epoch // 2
 
 training_args = TrainingArguments(
-    output_dir="./finetuned_4_options_full_dataset_rag",
+    output_dir="./finetuned_full_answer_rag",
     gradient_accumulation_steps = 64,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
@@ -332,7 +311,7 @@ training_args = TrainingArguments(
     save_steps=half_epoch_steps,            # ⬅️ half epoch
     max_grad_norm=0.5,
     logging_steps=len(train_dataset),
-    warmup_ratio = 0.05/2,
+    warmup_ratio = 0.05,
     gradient_checkpointing=True,
 )
 

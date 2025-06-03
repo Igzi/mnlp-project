@@ -2,7 +2,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
-import random
 import re
 import os
 import faiss
@@ -13,8 +12,8 @@ from langchain_community.vectorstores.utils import DistanceStrategy
 
 # ------------ CONFIG ------------
 MODEL_NAME = "igzi/finetuned_10_options_rag_new"
-DATASET = "Idavidrein/gpqa"
-SPLIT = "train"
+DATASET = "allenai/ai2_arc"
+SPLIT = "test"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_NEW_TOKENS = 1024
 BATCH_SIZE = 16  # Try 8, 16, or more depending on GPU
@@ -38,7 +37,7 @@ COT_PROMPT = (
 )
 
 # ------------ LOAD DATASET ------------
-ds = load_dataset(DATASET, "gpqa_main", split=SPLIT).shuffle(42)
+ds = load_dataset(DATASET, "ARC-Easy", split=SPLIT).shuffle(42)
 print(f"Loaded {len(ds)} samples from {DATASET} ({SPLIT})")
 
 # ------------ ANSWER EXTRACTION ------------
@@ -51,7 +50,6 @@ results = []
 correct = 0
 no_answer = 0
 fallback_correct = 0
-random.seed(42)
 
 out_dir = "../../lighteval-clean/lighteval-epfl-mnlp/community_tasks-Copy1/faiss_vector_db2"  # Directory for the saved index
 index_path = os.path.join(out_dir, "index.faiss")
@@ -89,16 +87,12 @@ if os.path.exists(index_path) and os.path.exists(docstore_path) and os.path.exis
 for i in tqdm(range(0, len(ds), BATCH_SIZE), desc="Evaluating"):
     batch = [ds[j] for j in range(i, min(i+BATCH_SIZE, len(ds)))]
     prompts = []
-    answers = []
     contexts = []
-    options_array = []
     for ex in batch:
-        options = [ex["Correct Answer"], ex["Incorrect Answer 1"], ex["Incorrect Answer 2"], ex["Incorrect Answer 3"]]
-        gold_ix = random.randint(0, 3)
-        options[0], options[gold_ix] = options[gold_ix], options[0]
+        choices = ex["choices"]["text"]
         retrieved_docs = vector_db.similarity_search(
-            query=f"{ex['Question']}\n" +
-            "".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, options)]) +
+            query=f"{ex['question']}\n" +
+            "".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, choices)]) +
             "Answer:", k=3)
         retrieved_docs_text = [doc.page_content for doc in retrieved_docs]
         context = "\nRelavent Documents:\n"
@@ -110,10 +104,9 @@ for i in tqdm(range(0, len(ds), BATCH_SIZE), desc="Evaluating"):
         contexts.append(context)
         prompts.append(COT_PROMPT.format(
             context=context,
-            question=ex["Question"]
-        )+"".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, options)])+"\nLet's think step by step.\n")
-        options_array.append(options)
-        answers.append(gold_ix)
+            question=ex["question"]
+        )+"".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, choices)])+"\nLet's think step by step.\n")
+    
     inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         output_ids = model.generate(
@@ -127,9 +120,12 @@ for i in tqdm(range(0, len(ds), BATCH_SIZE), desc="Evaluating"):
         generated = output_ids[j][inputs["input_ids"].shape[1]:]
         output = tokenizer.decode(generated, skip_special_tokens=True)
         pred = extract_letter(output)
-        gt = LETTER_INDICES[answers[j]]
-        options = options_array[j]
-        result = {"question": ex["Question"], "gt": gt, "pred": pred, "output": output}
+        answer = ex["answerKey"]
+        if not ('A' <= answer[0] <= 'Z'):
+            gt = LETTER_INDICES[int(answer) - 1]
+        else:
+            gt = answer
+        result = {"question": ex["question"], "gt": gt, "pred": pred, "output": output}
 
         if pred is not None:
             if pred == gt:
@@ -140,8 +136,8 @@ for i in tqdm(range(0, len(ds), BATCH_SIZE), desc="Evaluating"):
             # Format the prompt for direct answer
             direct_prompt = (
                 "The following are multiple choice questions (with answers) about knowledge and skills in advanced master-level STEM courses.\n\n"+contexts[j]+
-                f"{ex['Question']}\n" +
-                "".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, options)]) +
+                f"{ex['question']}\n" +
+                "".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, ex["choices"]["text"])]) +
                 "Answer:"
             )
             input_ids = tokenizer(direct_prompt, return_tensors="pt").to(DEVICE)
@@ -176,5 +172,5 @@ print(f"CoT answer extraction failed on {no_answer}/{total} samples")
 
 # Optionally: save results for later inspection
 import json
-with open(f"qwen3_cot_gpqa_{SPLIT}_results.json", "w") as f:
+with open(f"qwen3_cot_arc_easy_{SPLIT}_results.json", "w") as f:
     json.dump(results, f, indent=2)

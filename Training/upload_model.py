@@ -2,8 +2,8 @@ from huggingface_hub import HfApi, HfFolder, create_repo, upload_folder
 from transformers import AutoTokenizer
 
 # === Config ===
-repo_id = "igzi/finetuned_m2_mcqa_rag_new"
-checkpoint_path = "./finetuned_m2_mcqa_rag_new/checkpoint-258"
+repo_id = "igzi/finetuned_4_options_full_dataset_rag"
+checkpoint_path = "./finetuned_4_options_full_dataset_rag/checkpoint-259"
 
 api = HfApi()
 try:
@@ -16,7 +16,7 @@ upload_folder(
     folder_path=checkpoint_path,
     repo_id=repo_id,
     path_in_repo="",  # root
-    commit_message="Upload fine-tuned model checkpoint 258",
+    commit_message="Upload fine-tuned model checkpoint 259",
 )
 
 # Upload to your fine-tuned repo

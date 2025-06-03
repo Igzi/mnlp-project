@@ -3,9 +3,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 import re
+import os
+import faiss
+import pickle
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores.utils import DistanceStrategy
 
 # ------------ CONFIG ------------
-MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
+MODEL_NAME = "igzi/finetuned_10_options_rag_new"
 DATASET = "igzi/nlp4education"
 SPLIT = "train"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -26,9 +32,8 @@ COT_PROMPT = (
     "You are a STEM expert. Solve the following multiple choice question step by step. "
     "After your reasoning, print only the final answer on a new line in the format 'Final Answer: X', "
     "where X is A, B, C, or D.\n"
+    "{context}"
     "Question: {question}\n"
-    "A. {A}\nB. {B}\nC. {C}\nD. {D}\n"
-    "Let's think step by step.\n"
 )
 
 # ------------ LOAD DATASET ------------
@@ -46,18 +51,62 @@ correct = 0
 no_answer = 0
 fallback_correct = 0
 
+out_dir = "../../lighteval-clean/lighteval-epfl-mnlp/community_tasks-Copy1/faiss_vector_db2"  # Directory for the saved index
+index_path = os.path.join(out_dir, "index.faiss")
+docstore_path = os.path.join(out_dir, "docstore.pkl")
+mapping_path = os.path.join(out_dir, "index_to_docstore_id.pkl")
+
+model_kwargs = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu", # Dynamically check cuda
+}
+encode_kwargs = {
+    "normalize_embeddings": True
+}
+embedding_model = HuggingFaceEmbeddings(
+            model_name="igzi/MNLP_M2_document_encoder",
+            model_kwargs=model_kwargs,
+            encode_kwargs=encode_kwargs,
+        )
+
+# 1. Check if the files exist
+if os.path.exists(index_path) and os.path.exists(docstore_path) and os.path.exists(mapping_path):
+    index = faiss.read_index(index_path)
+    with open(docstore_path, "rb") as f:
+        docstore = pickle.load(f)
+    with open(mapping_path, "rb") as f:
+        index_to_docstore_id = pickle.load(f)
+    vector_db = FAISS(
+        embedding_function=embedding_model.embed_query,
+        index=index,
+        docstore=docstore,
+        index_to_docstore_id=index_to_docstore_id,
+        distance_strategy=DistanceStrategy.COSINE,
+        normalize_L2=True
+    )
+
 for i in tqdm(range(0, len(ds), BATCH_SIZE), desc="Evaluating"):
     batch = [ds[j] for j in range(i, min(i+BATCH_SIZE, len(ds)))]
-    prompts = [
-        COT_PROMPT.format(
-            question=ex["question"],
-            A=ex["choices"][0],
-            B=ex["choices"][1],
-            C=ex["choices"][2],
-            D=ex["choices"][3],
-        )
-        for ex in batch
-    ]
+    prompts = []
+    contexts = []
+    for ex in batch:
+        choices = ex["choices"]
+        retrieved_docs = vector_db.similarity_search(
+            query=f"{ex['question']}\n" +
+            "".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, choices)]) +
+            "Answer:", k=3)
+        retrieved_docs_text = [doc.page_content for doc in retrieved_docs]
+        context = "\nRelavent Documents:\n"
+        context += "\n\n".join([
+            f"Document {str(i)}:::\n" + doc
+            for i, doc in enumerate(retrieved_docs_text)
+        ])
+        context += "\n\n"
+        contexts.append(context)
+        prompts.append(COT_PROMPT.format(
+            context=context,
+            question=ex["question"]
+        )+"".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, choices)])+"\nLet's think step by step.\n")
+    
     inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         output_ids = model.generate(
@@ -71,7 +120,7 @@ for i in tqdm(range(0, len(ds), BATCH_SIZE), desc="Evaluating"):
         generated = output_ids[j][inputs["input_ids"].shape[1]:]
         output = tokenizer.decode(generated, skip_special_tokens=True)
         pred = extract_letter(output)
-        gt = ex["answer"]
+        gt = LETTER_INDICES[ex["answer"]]
         result = {"question": ex["question"], "gt": gt, "pred": pred, "output": output}
 
         if pred is not None:
@@ -82,7 +131,7 @@ for i in tqdm(range(0, len(ds), BATCH_SIZE), desc="Evaluating"):
             # Fallback to direct answer prediction
             # Format the prompt for direct answer
             direct_prompt = (
-                "The following are multiple choice questions (with answers) about knowledge and skills in advanced master-level STEM courses.\n\n"
+                "The following are multiple choice questions (with answers) about knowledge and skills in advanced master-level STEM courses.\n\n"+contexts[j]+
                 f"{ex['question']}\n" +
                 "".join([f"{key}. {choice}\n" for key, choice in zip(LETTER_INDICES, ex["choices"])]) +
                 "Answer:"
