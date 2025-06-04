@@ -1,14 +1,23 @@
+import os
 import torch
+import numpy as np
+import math
 import faiss
 import pickle
+from langchain.docstore import InMemoryDocstore
+from langchain.schema import Document
 from langchain_community.vectorstores.utils import DistanceStrategy
 from langchain_huggingface import HuggingFaceEmbeddings
 from datasets import load_dataset, concatenate_datasets
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM,
     Trainer, TrainingArguments,
+    DataCollatorWithPadding
 )
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
 from torch.utils.data import Dataset
+from sklearn.metrics import accuracy_score
 from langchain_community.vectorstores import FAISS
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
@@ -99,7 +108,7 @@ class MCQADatasetClassification(Dataset):
 
         return {
             "prompt": prompt,
-            "options": [f" {letter}" for letter in LETTER_INDICES[:len(ex["choices"])]],
+            "options": [f" {letter}. {answer}" for letter, answer in zip(LETTER_INDICES[:len(ex["choices"])], ex["choices"])],
             "correct_idx": correct_index,
             "dataset": ex["dataset"]
         }
@@ -107,55 +116,39 @@ class MCQADatasetClassification(Dataset):
 
 class MCQATrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        For each prompt we run the model once, grab the final (next‐token)
-        logits, index into the letter‐token IDs, and compute a CE loss.
-        """
-        device = model.device
-        prompts      = inputs["prompt"]       # List[str]
+        prompts = inputs["prompt"]            # List[str]
+        completions = inputs["options"]       # List[List[str]]
         correct_idxs = inputs["correct_idx"]  # List[int]
-        all_options  = inputs["options"]      # List[List[str]]
-
-        batch_logits = []
+        device = model.device
         losses = []
+        all_outputs = []
+    
+        for i in range(len(prompts)):
+            prompt = prompts[i]
+            options = completions[i]
+            target_idx = correct_idxs[i]
+            target_completion = options[target_idx]
+            enc = tokenizer(prompt, return_tensors="pt").to(device)
+            target = tokenizer(target_completion, return_tensors="pt", add_special_tokens=False).to(device)
+    
+            # Prepare labels: prompt tokens = -100 (ignored), answer tokens = actual token ids
+            input_ids = torch.cat([enc["input_ids"], target["input_ids"]], dim=1)
+            labels = input_ids.clone()
+    
+            output = model(input_ids=input_ids, labels=labels)
+            loss = output.loss
+            losses.append(loss)
+            if return_outputs:
+                all_outputs.append(output)
+    
+        losses = torch.stack(losses)
+        mean_loss = losses.mean()
+    
+        if return_outputs:
+            return mean_loss, all_outputs
+        else:
+            return mean_loss
 
-        # Pre‐tokenize all option‐letters to single token IDs
-        option_token_ids = [
-            [ tokenizer(opt, add_special_tokens=False).input_ids[0]
-              for opt in opts ]
-            for opts in all_options
-        ]
-
-        for prompt, opt_ids, target in zip(prompts, option_token_ids, correct_idxs):
-            # 1) encode prompt
-            enc = tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=2048
-            ).to(device)
-
-            # 2) single forward pass
-            outputs = model(**enc)
-            # outputs.logits: [1, seq_len, vocab_size]
-            last_logits = outputs.logits[:, -1, :]            # [1, V]
-
-            # 3) pick out the logits for our option tokens → [1, num_opts]
-            opt_logits = last_logits[:, opt_ids]               # [1, num_opts]
-            batch_logits.append(opt_logits.squeeze(0))         # [num_opts]
-
-            # 4) CE against the correct index
-            tgt = torch.tensor([target], device=device)
-            losses.append(F.cross_entropy(opt_logits, tgt))
-
-            del enc, outputs, last_logits, opt_logits, tgt
-            torch.cuda.empty_cache()
-
-        loss = torch.stack(losses).mean()
-        logits = torch.stack(batch_logits)                   # [batch, num_opts]
-
-        return (loss, logits) if return_outputs else loss
 
     def get_train_dataloader(self) -> DataLoader:
         dataloader_params = {
@@ -252,18 +245,40 @@ class MCQATrainer(Trainer):
 
 # === Load Fine-tuning and Validation Datasets ===
 print("🔍 Loading datasets...")
+# train_data = concatenate_datasets([
+#     load_dataset(MCQA_DS, 'MMLU', split="train").select(range(1000)),
+#     # load_dataset(MCQA_DS, 'ARC-Easy', split="train").select(range(100)),
+#     # load_dataset(MCQA_DS, 'OpenBookQA', split="train").select(range(100)),
+#     # load_dataset(MCQA_DS, 'ScienceQA', split="train").select(range(100))
+# ])
+
+# # === Validation data ===
+# val_data = concatenate_datasets([
+#     load_dataset(MCQA_DS, 'MMLU', split="validation").select(range(100)),
+#     # load_dataset(MCQA_DS, 'ARC-Easy', split="validation").select(range(40)),
+#     # load_dataset(MCQA_DS, 'OpenBookQA', split="validation").select(range(40)),
+#     # load_dataset(MCQA_DS, 'ScienceQA', split="validation").select(range(40))
+# ])
 
 train_data = concatenate_datasets([
     load_dataset(MCQA_DS, 'MMLU', split="train"),
     load_dataset(MCQA_DS, 'ARC-Easy', split="train"),
     load_dataset(MCQA_DS, 'ARC-Challenge', split="train"),
+    # load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
+    # load_dataset(MCQA_DS, 'SciQ', split="train"),
+    #load_dataset(MCQA_DS, 'MMLU-PRO', split="train"),
+    # load_dataset(MCQA_DS, 'OpenBookQA', split="train"),
+    # load_dataset(MCQA_DS, 'ScienceQA', split="train")
 ])
 
 # === Validation data ===
 val_data = concatenate_datasets([
     load_dataset(MCQA_DS, 'MMLU', split="validation"),
     load_dataset(MCQA_DS, 'ARC-Easy', split="validation"),
-    load_dataset(MCQA_DS, 'ARC-Challenge', split="validation")
+    load_dataset(MCQA_DS, 'ARC-Challenge', split="validation"),
+    #load_dataset(MCQA_DS, 'MMLU-PRO', split="validation").shuffle(seed=42).select(range(500)),
+    # load_dataset(MCQA_DS, 'OpenBookQA', split="validation"),
+    # load_dataset(MCQA_DS, 'ScienceQA', split="validation")
 ])
 
 
@@ -284,7 +299,7 @@ steps_per_epoch = len(train_dataset) // 64
 half_epoch_steps = steps_per_epoch // 2
 
 training_args = TrainingArguments(
-    output_dir="./finetuned_rag_final",
+    output_dir="./finetuned_full_answer_rag",
     gradient_accumulation_steps = 64,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
@@ -294,6 +309,7 @@ training_args = TrainingArguments(
     save_safetensors=False,                 # ✅ Save in .bin format to reduce size
     logging_dir="./logs",
     push_to_hub=True,
+    hub_model_id="igzi/Qwen3-0.6B-full-dataset-mcqa",
     eval_strategy="steps",                  # ⬅️ switched from 'epoch'
     save_strategy="steps",                  # ⬅️ switched from 'epoch'
     eval_steps=half_epoch_steps,            # ⬅️ half epoch
