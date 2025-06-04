@@ -1,0 +1,7 @@
+python cot_evaluation_mmlu.py
+python cot_evaluation_mmlu_pro.py
+python cot_evaluation_arc_easy.py
+python cot_evaluation_arc_challenge.py
+python cot_evaluation_nlp4ed.py
+python cot_evaluation_gpqa.py
+python cot_evaluation_musr.py
